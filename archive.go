@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/klauspost/pgzip"
@@ -20,7 +21,7 @@ const (
 	TypeTar Type = 1 + iota
 )
 
-// Compressor represents the compressor type.
+// Compressor represents the compression type.
 type Compressor int
 
 // Constants to identify compression type.
@@ -31,15 +32,62 @@ const (
 
 // Archive provides access to an archive.
 type Archive struct {
-	Type       Type       // Type specified the archive type.
+	Type       Type       // Type specifies the archive type.
 	Compressor Compressor // Compressor specifies the compressor to use.
 	Writer     io.Writer  // Writer provides sequential writing of an archive.
-	ReadLimit  int64      // ReadLimit allows to set a limit to the data read.
+	ReadLimit  int64      // ReadLimit allows to limit the data read.
+	WriteLimit int64      // WriteLimit allows to limit the data written, i.e., the archive size.
 
-	tar       *tar.Writer
-	pgzip     *pgzip.Writer
-	readbytes int64
+	setup     bool
 	closed    bool
+	readbytes int64
+
+	tar   *tar.Writer
+	pgzip *pgzip.Writer
+}
+
+// LimitData limits the maximum size of the data to be archived.
+func (a *Archive) LimitData(limit int64) *Archive {
+	a.ReadLimit = limit
+	return a
+}
+
+// LimitArchive sets the maximum size an archive may grow to.
+func (a *Archive) LimitArchive(limit int64) *Archive {
+	a.WriteLimit = limit
+	return a
+}
+
+// Setup initializes resources used by the archive.
+func (a *Archive) Setup() error {
+	if a.setup {
+		return nil
+	}
+
+	w := a.Writer
+	if a.WriteLimit > 0 {
+		w = NewLimitWriter(w, a.WriteLimit)
+	}
+
+	switch a.Compressor {
+	case CompressorNone:
+	case CompressorGzip:
+		a.pgzip = pgzip.NewWriter(w)
+		_ = a.pgzip.SetConcurrency(512000, runtime.NumCPU()*2)
+		w = a.pgzip
+	default:
+		return errors.New("compressor not supported")
+	}
+
+	switch a.Type {
+	case TypeTar:
+		a.tar = tar.NewWriter(w)
+	default:
+		return errors.New("archive type not supported")
+	}
+
+	a.setup = true
+	return nil
 }
 
 // Close closes all ressources used by the archive.
@@ -49,26 +97,33 @@ func (a *Archive) Close() error {
 	}
 	a.closed = true
 
+	var errlist []string
 	if a.tar != nil {
 		if err := a.tar.Close(); err != nil {
-			return errors.Wrap(err, "closing tar")
+			errlist = append(errlist, errors.Wrap(err, "closing tar").Error())
 		}
 	}
 	if a.pgzip != nil {
 		if err := a.pgzip.Close(); err != nil {
-			return errors.Wrap(err, "closing gzip")
+			errlist = append(errlist, errors.Wrap(err, "closing gzip").Error())
 		}
+	}
+	if len(errlist) > 0 {
+		return errors.New(strings.Join(errlist, ", "))
 	}
 	return nil
 }
 
 // ArchivePath archives the given path.
 func (a *Archive) ArchivePath(path string) error {
+	if err := a.Setup(); err != nil {
+		return errors.Wrap(err, "setup failed")
+	}
 	base := filepath.Clean(path)
 
 	prepend := ""
-	if filepath.Base(os.Args[1]) != "." {
-		prepend = filepath.Base(os.Args[1])
+	if filepath.Base(path) != "." {
+		prepend = filepath.Base(path)
 	}
 
 	return filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
@@ -99,6 +154,10 @@ func (a *Archive) ArchivePath(path string) error {
 
 // AddEntry adds a new file system entry to the archive.
 func (a *Archive) AddEntry(path, name string, info os.FileInfo) error {
+	if err := a.Setup(); err != nil {
+		return errors.Wrap(err, "setup failed")
+	}
+
 	switch a.Type {
 	case TypeTar: // OK
 	default:

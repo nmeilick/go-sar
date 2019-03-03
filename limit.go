@@ -6,14 +6,14 @@ import "io"
 type WriteLimitExceeded struct{}
 
 func (WriteLimitExceeded) Error() string {
-	return "written data exceeds the set limit"
+	return "written data exceeds the limit set"
 }
 
 // ReadLimitExceeded is an error object returned when a read would exceed a set limit.
 type ReadLimitExceeded struct{}
 
 func (ReadLimitExceeded) Error() string {
-	return "read data exceeds the set limit"
+	return "read data exceeds the limit set"
 }
 
 // LimitWriter wraps a Writer and returns an error if the written data exceeds a given limit.

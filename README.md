@@ -14,11 +14,10 @@ if err := a.ArchivePath("/some/file/or/folder"); err != nil {
 }
 ```
 
-Limit the size of input and output:
+Limit the archive size to 10 MiB and the size of the data read to 200 MiB:
 ```golang
 h, _ := os.OpenFile("test.tar.gz", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-a := sar.NewTarGz(sar.NewLimitWriter(1*1024*1024)) // Limit archive size to 1MiB
-a.ReadLimit = 100*1024*1024 // Abort with error if total data is larger than 100MiB
+a := sar.NewTarGz().LimitArchive(10*1024*1024).LimitData(200*1024*1024)
 defer a.Close()
 if err := a.ArchivePath("/some/file/or/folder"); err != nil {
   log.Fatal(err)
