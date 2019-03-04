@@ -115,41 +115,48 @@ func (a *Archive) Close() error {
 }
 
 // ArchivePath archives the given path.
-func (a *Archive) ArchivePath(path string) error {
+func (a *Archive) ArchivePath(paths ...string) error {
 	if err := a.Setup(); err != nil {
 		return errors.Wrap(err, "setup failed")
 	}
-	base := filepath.Clean(path)
 
-	prepend := ""
-	if filepath.Base(path) != "." {
-		prepend = filepath.Base(path)
-	}
+	for _, path := range paths {
+		base := filepath.Clean(path)
 
-	return filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
+		prepend := ""
+		if filepath.Base(path) != "." {
+			prepend = filepath.Base(path)
+		}
+
+		err := filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			relpath, err := filepath.Rel(base, path)
+			if err != nil {
+				return errors.Wrap(err, "filepath.Rel")
+			}
+			switch relpath {
+			case ".":
+				if !info.IsDir() {
+					return a.AddEntry(path, filepath.Base(path), info)
+				}
+				relpath = ""
+			}
+			if prepend != "" {
+				relpath = filepath.Join(prepend, relpath)
+			}
+			if relpath == "" {
+				return nil
+			}
+			relpath = strings.Replace(relpath, `\`, "/", -1)
+			return a.AddEntry(path, relpath, info)
+		})
 		if err != nil {
 			return err
 		}
-		relpath, err := filepath.Rel(base, path)
-		if err != nil {
-			return errors.Wrap(err, "filepath.Rel")
-		}
-		switch relpath {
-		case ".":
-			if !info.IsDir() {
-				return a.AddEntry(path, filepath.Base(path), info)
-			}
-			relpath = ""
-		}
-		if prepend != "" {
-			relpath = filepath.Join(prepend, relpath)
-		}
-		if relpath == "" {
-			return nil
-		}
-		relpath = strings.Replace(relpath, `\`, "/", -1)
-		return a.AddEntry(path, relpath, info)
-	})
+	}
+	return nil
 }
 
 // AddEntry adds a new file system entry to the archive.

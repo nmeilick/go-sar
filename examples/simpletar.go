@@ -42,10 +42,8 @@ func main() {
 		a.LimitData(int64(*dmax))
 	}
 
-	for _, p := range flag.Args() {
-		if err = a.ArchivePath(p); err != nil {
-			fail("Archiving failed: %s: %s", p, err)
-		}
+	if err = a.ArchivePath(flag.Args()...); err != nil {
+		fail("Archiving failed: %s", err)
 	}
 	a.Close()
 	fd.Close()
