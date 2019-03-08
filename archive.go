@@ -2,14 +2,17 @@ package sar
 
 import (
 	"archive/tar"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/klauspost/pgzip"
 	"github.com/pkg/errors"
+	"golang.org/x/sys/unix"
 )
 
 // Type represents the archive type.
@@ -35,6 +38,7 @@ type Archive struct {
 	Type       Type       // Type specifies the archive type.
 	Compressor Compressor // Compressor specifies the compressor to use.
 	Writer     io.Writer  // Writer provides sequential writing of an archive.
+	Reader     io.Reader  // Reader provides sequential reading of an archive.
 	ReadLimit  int64      // ReadLimit allows to limit the data read.
 	WriteLimit int64      // WriteLimit allows to limit the data written, i.e., the archive size.
 
@@ -42,8 +46,22 @@ type Archive struct {
 	closed    bool
 	readbytes int64
 
-	tar   *tar.Writer
-	pgzip *pgzip.Writer
+	tarR   *tar.Reader
+	tarW   *tar.Writer
+	pgzipR *pgzip.Reader
+	pgzipW *pgzip.Writer
+}
+
+// WithWriter sets the backing writer.
+func (a *Archive) WithWriter(w io.Writer) *Archive {
+	a.Writer = w
+	return a
+}
+
+// WithWriter sets the backing reader.
+func (a *Archive) WithReader(r io.Reader) *Archive {
+	a.Reader = r
+	return a
 }
 
 // LimitData limits the maximum size of the data to be archived.
@@ -58,8 +76,8 @@ func (a *Archive) LimitArchive(limit int64) *Archive {
 	return a
 }
 
-// Setup initializes resources used by the archive.
-func (a *Archive) Setup() error {
+// SetupWriter initializes resources used needed for creating an archive.
+func (a *Archive) SetupWriter() error {
 	if a.setup {
 		return nil
 	}
@@ -72,16 +90,50 @@ func (a *Archive) Setup() error {
 	switch a.Compressor {
 	case CompressorNone:
 	case CompressorGzip:
-		a.pgzip = pgzip.NewWriter(w)
-		_ = a.pgzip.SetConcurrency(512000, runtime.NumCPU()*2)
-		w = a.pgzip
+		a.pgzipW = pgzip.NewWriter(w)
+		_ = a.pgzipW.SetConcurrency(512000, runtime.NumCPU()*2)
+		w = a.pgzipW
 	default:
 		return errors.New("compressor not supported")
 	}
 
 	switch a.Type {
 	case TypeTar:
-		a.tar = tar.NewWriter(w)
+		a.tarW = tar.NewWriter(w)
+	default:
+		return errors.New("archive type not supported")
+	}
+
+	a.setup = true
+	return nil
+}
+
+// SetupReader initializes resources used needed for reading an archive.
+func (a *Archive) SetupReader() error {
+	if a.setup {
+		return nil
+	}
+
+	r := a.Reader
+
+	// TODO: Handle limits?
+
+	switch a.Compressor {
+	case CompressorNone:
+	case CompressorGzip:
+		if pgzipR, err := pgzip.NewReader(r); err != nil {
+			return err
+		} else {
+			a.pgzipR = pgzipR
+		}
+		r = a.pgzipR
+	default:
+		return errors.New("compressor not supported")
+	}
+
+	switch a.Type {
+	case TypeTar:
+		a.tarR = tar.NewReader(r)
 	default:
 		return errors.New("archive type not supported")
 	}
@@ -98,13 +150,18 @@ func (a *Archive) Close() error {
 	a.closed = true
 
 	var errlist []string
-	if a.tar != nil {
-		if err := a.tar.Close(); err != nil {
-			errlist = append(errlist, errors.Wrap(err, "closing tar").Error())
+	if a.tarW != nil {
+		if err := a.tarW.Close(); err != nil {
+			errlist = append(errlist, errors.Wrap(err, "closing tar writer").Error())
 		}
 	}
-	if a.pgzip != nil {
-		if err := a.pgzip.Close(); err != nil {
+	if a.pgzipW != nil {
+		if err := a.pgzipW.Close(); err != nil {
+			errlist = append(errlist, errors.Wrap(err, "closing gzip").Error())
+		}
+	}
+	if a.pgzipR != nil {
+		if err := a.pgzipR.Close(); err != nil {
 			errlist = append(errlist, errors.Wrap(err, "closing gzip").Error())
 		}
 	}
@@ -116,7 +173,7 @@ func (a *Archive) Close() error {
 
 // ArchivePath archives the given path.
 func (a *Archive) ArchivePath(paths ...string) error {
-	if err := a.Setup(); err != nil {
+	if err := a.SetupWriter(); err != nil {
 		return errors.Wrap(err, "setup failed")
 	}
 
@@ -161,7 +218,7 @@ func (a *Archive) ArchivePath(paths ...string) error {
 
 // AddEntry adds a new file system entry to the archive.
 func (a *Archive) AddEntry(path, name string, info os.FileInfo) error {
-	if err := a.Setup(); err != nil {
+	if err := a.SetupWriter(); err != nil {
 		return errors.Wrap(err, "setup failed")
 	}
 
@@ -185,7 +242,7 @@ func (a *Archive) AddEntry(path, name string, info os.FileInfo) error {
 	}
 
 	h.Name = name
-	if err := a.tar.WriteHeader(h); err != nil {
+	if err := a.tarW.WriteHeader(h); err != nil {
 		return errors.Wrap(err, "writing header")
 	}
 
@@ -198,13 +255,182 @@ func (a *Archive) AddEntry(path, name string, info os.FileInfo) error {
 		if a.ReadLimit > 0 && a.readbytes+h.Size > a.ReadLimit {
 			return ReadLimitExceeded{}
 		}
-		n, err := io.CopyN(a.tar, fd, h.Size)
+		n, err := io.CopyN(a.tarW, fd, h.Size)
 		a.readbytes += int64(n)
 		if err != nil {
 			return errors.Wrap(err, "adding file")
 		}
 		if n < h.Size {
 			return errors.Wrap(err, "short read")
+		}
+	}
+	return nil
+}
+
+// ExtractOptions specifies how an archive is to be extracted.
+type ExtractOptions struct {
+	Overwrite         bool
+	RestoreOwner      bool
+	RestoreTimestamps bool
+	FailOnError       bool
+}
+
+// NewExtractOptions returns an pointer to an ExtractOptions structure
+// initialized with defaults values.
+func NewExtractOptions() *ExtractOptions {
+	return &ExtractOptions{
+		Overwrite:         true,
+		RestoreOwner:      false,
+		RestoreTimestamps: true,
+		FailOnError:       false,
+	}
+}
+
+// Apply set metadata on a path according to configured rules.
+func (o *ExtractOptions) Apply(path string, h *tar.Header) error {
+	var problems []string
+	if o.RestoreOwner && runtime.GOOS != "windows" {
+		if err := os.Chown(path, h.Uid, h.Gid); err != nil {
+			problems = append(problems, fmt.Sprintf("setting owner: %s", err))
+		}
+	}
+
+	if o.RestoreTimestamps {
+		if err := os.Chtimes(path, h.AccessTime, h.ModTime); err != nil {
+			problems = append(problems, fmt.Sprintf("setting times: %s", err))
+		}
+	}
+
+	if len(problems) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(problems, ", "))
+}
+
+// Extract extracts an archive to a given path according to the given rules.
+func (a *Archive) Extract(base string, opts *ExtractOptions) error {
+	if err := a.SetupReader(); err != nil {
+		return errors.Wrap(err, "setup failed")
+	}
+	defer a.Close()
+
+	seen := map[string]bool{}
+	for {
+		h, err := a.tarR.Next()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+
+		h.Name = filepath.Clean(h.Name)
+		path := filepath.Join(base, h.Name)
+		info := h.FileInfo()
+
+		if !opts.Overwrite {
+			if _, err := os.Stat(path); err == nil {
+				continue
+			}
+		}
+
+		if dir := filepath.Dir(path); !seen[dir] {
+			seen[dir] = true
+			os.MkdirAll(dir, 0755)
+		}
+
+		switch h.Typeflag {
+		case tar.TypeDir:
+			err := os.MkdirAll(path, info.Mode().Perm())
+			if err != nil {
+				fmt.Printf("%s: failed to create directory: %s\n", path, err)
+				if opts.FailOnError {
+					return errors.Wrap(err, "mkdir failed")
+				}
+			}
+			seen[path] = true
+		case tar.TypeReg, tar.TypeRegA:
+			fd, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
+			if err != nil {
+				fmt.Printf("%s: create failed: %s\n", path, err)
+				if opts.FailOnError {
+					return errors.Wrap(err, "create failed")
+				}
+			}
+			_, err = io.Copy(fd, a.tarR) // check size?
+			if err != nil {
+				fmt.Printf("%s: write failed: %s\n", path, err)
+				if opts.FailOnError {
+					return errors.Wrap(err, "write failed")
+				}
+			}
+		case tar.TypeLink:
+			oldname := filepath.Join(base, h.Linkname)
+			switch runtime.GOOS {
+			case "windows":
+				if err := copy(oldname, path); err != nil {
+					fmt.Printf("%s: copy failed: %s\n", oldname, err)
+					if opts.FailOnError {
+						return errors.Wrap(err, "copy failed")
+					}
+				}
+			default:
+				os.Remove(path)
+				err := os.Link(oldname, path)
+				if err != nil {
+					fmt.Printf("%s: link failed: %s\n", path, err)
+					if opts.FailOnError {
+						return errors.Wrap(err, "link failed")
+					}
+				}
+			}
+		case tar.TypeSymlink:
+			switch runtime.GOOS {
+			case "windows":
+				oldname := filepath.Join(base, h.Linkname)
+				if err := copy(oldname, path); err != nil {
+					fmt.Printf("%s: copy failed: %s\n", oldname, err)
+					if opts.FailOnError {
+						return errors.Wrap(err, "copy failed")
+					}
+				}
+			default:
+				os.Remove(path)
+				err := os.Symlink(h.Linkname, path)
+				if err != nil {
+					fmt.Printf("%s: symlink failed: %s\n", path, err)
+					if opts.FailOnError {
+						return errors.Wrap(err, "symlink failed")
+					}
+				}
+			}
+			continue // Do not set attributes
+		case tar.TypeChar, tar.TypeBlock:
+			dev := unix.Mkdev(uint32(h.Devmajor), uint32(h.Devminor))
+			mode := h.Mode
+			if h.Typeflag == tar.TypeChar {
+				mode |= unix.S_IFCHR
+			} else {
+				mode |= unix.S_IFBLK
+			}
+
+			os.Remove(path)
+			err := syscall.Mknod(path, uint32(mode), int(dev))
+			if err != nil {
+				fmt.Printf("%s: mknod failed: %s\n", path, err)
+				if opts.FailOnError {
+					return errors.Wrap(err, "mknod failed")
+				}
+			}
+		default:
+			fmt.Printf("%s: Unsupported type: %v\n", path, h.Typeflag)
+			continue
+		}
+
+		if err := opts.Apply(path, h); err != nil {
+			if opts.FailOnError {
+				return fmt.Errorf("%s: %s", path, err)
+			}
 		}
 	}
 	return nil

@@ -34,7 +34,7 @@ func main() {
 		fail("Failed to create archive: %s", err)
 	}
 
-	a := sar.NewTarGz(fd)
+	a := sar.NewTarGz().WithWriter(fd)
 	if *amax > 0 {
 		a.LimitArchive(int64(*amax))
 	}
