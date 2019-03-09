@@ -3,7 +3,13 @@ package sar
 import (
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 )
+
+func cleanPath(path string) string {
+	return filepath.Clean(strings.Replace(path, `\`, "/", -1))
+}
 
 func copy(src, dst string) error {
 	rstat, err := os.Lstat(src)
