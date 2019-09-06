@@ -4,20 +4,27 @@ import (
 	"archive/tar"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/mattn/go-isatty"
+	matty "github.com/mattn/go-tty"
 	"github.com/pkg/errors"
 )
 
 // ExtractOptions specifies how an archive is to be extracted.
 type ExtractOptions struct {
+	Verbose           bool
 	Overwrite         bool
+	Interactive       bool
 	RestoreOwner      bool
 	RestoreTimestamps bool
 	FailOnError       bool
 	ShowErrors        bool
+	Stdout            io.Writer
+	Stderr            io.Writer
 	Errors            []error
 }
 
@@ -25,11 +32,15 @@ type ExtractOptions struct {
 // initialized with defaults values.
 func NewExtractOptions() *ExtractOptions {
 	return &ExtractOptions{
+		Verbose:           false,
 		Overwrite:         true,
+		Interactive:       true,
 		RestoreOwner:      false,
 		RestoreTimestamps: true,
 		FailOnError:       false,
 		ShowErrors:        true,
+		Stdout:            os.Stdout,
+		Stderr:            os.Stderr,
 		Errors:            []error{},
 	}
 }
@@ -57,7 +68,11 @@ func (o *ExtractOptions) Apply(path string, h *tar.Header) error {
 
 // Extract extracts an archive to a given path according to the given rules.
 func (a *Archive) Extract(base string, opts *ExtractOptions) error {
+	if opts == nil {
+		opts = NewExtractOptions()
+	}
 	base = cleanPath(base)
+
 	bstat, err := os.Stat(base)
 	switch {
 	case os.IsNotExist(err):
@@ -73,6 +88,24 @@ func (a *Archive) Extract(base string, opts *ExtractOptions) error {
 	}
 	defer a.Close()
 
+	var tty *matty.TTY
+	interactive, overwrite := opts.Interactive, opts.Overwrite
+	if interactive {
+		switch {
+		case isatty.IsTerminal(os.Stdout.Fd()):
+		default:
+			interactive = false
+		}
+	}
+
+	hOut, hErr := opts.Stdout, opts.Stderr
+	if hOut == nil {
+		hOut = ioutil.Discard
+	}
+	if hErr == nil {
+		hOut = ioutil.Discard
+	}
+
 	seen := map[string]bool{}
 	for {
 		h, err := a.tarR.Next()
@@ -87,10 +120,58 @@ func (a *Archive) Extract(base string, opts *ExtractOptions) error {
 		h.Linkname = cleanPath(h.Name)
 		path := filepath.Join(base, h.Name)
 
-		// Check if the path to extract already exists.
+		// Check if the path to extract to already exists.
 		if _, err := os.Lstat(path); err == nil {
-			if !opts.Overwrite {
-				continue
+			if !overwrite {
+				if !interactive {
+					fmt.Fprintf(hErr, "Destination already exists, skipping: %s\n", path)
+					continue
+				}
+
+				if tty == nil {
+					var err error
+					tty, err = matty.Open()
+					if err != nil {
+						fmt.Fprintf(hErr, "Failed to open TTY, disable interactive mode: %s\n", err.Error())
+						fmt.Fprintf(hErr, "Destination already exists, skipping: %s\n", path)
+						interactive = false
+						continue
+					}
+					defer tty.Close()
+				}
+				fmt.Printf("Overwrite %s (y=yes, n=no, a=all, N=none, q=quit)? ", path)
+
+			input:
+				r, err := tty.ReadRune()
+				if err != nil {
+					fmt.Fprintf(hErr, "Reading from TTY failed, disabling interactive mode: %s\n", err.Error())
+					interactive = false
+					continue
+				}
+
+				skip := true
+				switch r {
+				case 'y':
+					fmt.Print("yes\n")
+					skip = false
+				case 'n', '\r', '\n':
+					fmt.Print("no\n")
+				case 'a', 'A':
+					fmt.Print("all\n")
+					skip = false
+					overwrite = true
+				case 'N':
+					fmt.Print("none\n")
+					interactive = false
+				case 'q', 'Q':
+					fmt.Print("quit\n")
+					return ExtractionAbortedError{}
+				default:
+					goto input
+				}
+				if skip {
+					continue
+				}
 			}
 
 			// Remove existing path but ignore errors as problems will manifest themselves
@@ -102,6 +183,9 @@ func (a *Archive) Extract(base string, opts *ExtractOptions) error {
 				seen[dir] = true
 				os.MkdirAll(dir, bstat.Mode().Perm())
 			}
+		}
+		if opts.Verbose {
+			fmt.Fprintf(hOut, "Extracting: %s\n", path)
 		}
 
 		err = nil
@@ -165,4 +249,10 @@ func (a *Archive) extractFile(base string, h *tar.Header, opts *ExtractOptions) 
 		return errors.Wrap(err, "write")
 	}
 	return nil
+}
+
+type ExtractionAbortedError struct{}
+
+func (e ExtractionAbortedError) Error() string {
+	return "aborted by user"
 }
